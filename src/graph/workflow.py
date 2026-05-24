@@ -9,32 +9,42 @@ from src.logger.logger import logger
 from langsmith import traceable
 import os
 
+
 @traceable(run_type="llm")
 def get_llm():
     return ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0)
+
 
 @traceable
 def route_question(state: ResearchAssistantState) -> ResearchAssistantState:
     question = state.get("question", "")
     logger.info(f"[Router] Analyzing: {question}")
 
-    router_prompt = PromptTemplate.from_template(
-        """Analyze the user question. Determine if it needs:
-        1. 'rag': Only internal documents (e.g., specific company data, PDFs).
-        2. 'web_search': Only general/current web info.
-        3. 'both': Needs internal context AND web updates for a refined answer.
+    router_prompt = PromptTemplate.from_template("""
+                You are a routing classifier.
 
-        Respond with ONLY one word: 'rag', 'web_search', or 'both'.
-        Question: {question}"""
-    )
+                Rules:
+                    - rag → answer comes only from internal documents/PDFs/company data
+                    - web_search → answer needs public or current information
+                    - both → answer requires internal documents plus public/current information
+
+                Return exactly one token:
+
+                    rag
+                    web_search
+                    both
+
+                    Question: {question}
+                    """)
 
     chain = router_prompt | get_llm() | StrOutputParser()
     route = chain.invoke({"question": question}).strip().lower()
-    
+
     if route not in ["rag", "web_search", "both"]:
         route = "both"
-    
+
     return {"route": route}
+
 
 @traceable
 def retrieve(state: ResearchAssistantState) -> ResearchAssistantState:
@@ -48,38 +58,45 @@ def retrieve(state: ResearchAssistantState) -> ResearchAssistantState:
         return {"context": context, "sources": sources}
     except Exception as e:
         logger.error(f"RAG Error: {e}")
-        return {"context": ["RAG retrieval failed."]}
+        return {"context": [], "sources": ["Retrieval failed"]}
 
 
 @traceable
 def generate(state: ResearchAssistantState) -> ResearchAssistantState:
     """The LLM takes everything found so far and creates a refined response."""
     question = state.get("question", "")
-    context  = state.get("context", [])
-    
-    
+    context = state.get("context", [])
+    sources = state.get("sources", [])
+
     logger.info("[Generator] Refining final response with LLM synthesis...")
 
-    generate_prompt = PromptTemplate.from_template(
-        """You are an advanced Research Assistant. 
-        Your task is to synthesize the provided context into a professional, refined answer.
-        
-        Rules:
-        1. If RAG data and Web data conflict, prioritize RAG for internal facts.
-        2. Use a professional tone.
-        3. Mention if the information came from internal docs or the web.
+    generate_prompt = PromptTemplate.from_template("""
+You are an advanced Research Assistant.
 
-        Context:
-        {context}
+Context:
+{context}
 
-        Question: {question}
+Sources:
+{sources}
 
-        Refined Answer:"""
-    )
+Question:
+{question}
+
+Rules:
+1. Prioritize internal RAG data over web information.
+2. Cite source origins where possible.
+3. If context is insufficient, say so explicitly.
+
+Refined Answer:
+""")
 
     context_str = "\n\n---\n\n".join(context) if context else "No context available."
     chain = generate_prompt | get_llm() | StrOutputParser()
-    generation = chain.invoke({"context": context_str, "question": question})
+    generation = chain.invoke({
+    "context": context_str,
+    "sources": ", ".join(sources),
+    "question": question
+})
 
     return {"generation": generation}
 
@@ -95,21 +112,25 @@ def build_workflow():
 
     workflow.set_entry_point("router")
 
-    # Conditional edge
+    # Initial routing
     workflow.add_conditional_edges(
         "router",
-        lambda x: x["route"],
-        {
-            "rag": "retrieve",
-            "web_search": "web_search",
-            "both": "retrieve"
-        }
+        lambda state: state["route"],
+        {"rag": "retrieve", "web_search": "web_search", "both": "retrieve"},
     )
 
-    workflow.add_edge("retrieve", "web_search")
+    # After retrieval decide where to go
+    workflow.add_conditional_edges(
+        "retrieve",
+        lambda state: state["route"],
+        {"rag": "generate", "both": "web_search"},
+    )
+
     workflow.add_edge("web_search", "generate")
+
     workflow.add_edge("generate", END)
 
     return workflow.compile()
+
 
 workflow = build_workflow()
