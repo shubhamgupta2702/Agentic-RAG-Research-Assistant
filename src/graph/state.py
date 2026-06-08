@@ -19,3 +19,6 @@ class ResearchAssistantState(TypedDict, total=False):
     generation: str
 
     sources: Annotated[List[str], operator.add]
+    
+    grade: str
+    retry_count: int
